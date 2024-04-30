@@ -2,15 +2,15 @@
 #include <cassert>
 #include <map>
 #include <vector>
-#include "skewed_prediction.h"
 #include "cache.h"
 
 class SamplingDeadBlockPredictor {
 private:
     int kPredictorEntries = 4096;
     int kPredictorTables = 3;
-    int kSamplerSets = 32;
-    int kSamplerAssoc = 12;
+    int kSamplerSets  = 32;
+    int kSamplerAssoc  = 12;
+    int blockSize = 64;
 
     struct SamplerEntry {
         uint16_t partialTag : 15;
@@ -25,7 +25,7 @@ private:
     };
 
     std::vector<SamplerEntry> sampler;
-    std::vector<std::vector<PredictorEntry>> predictor;
+    std::vector<std::vector<PredictorEntry>> predictor; // skewed predict tables
 
     uint16_t signature(uint64_t pc) {
         return pc & 0x7FFF;
@@ -35,42 +35,49 @@ private:
     }
 
 public:
-    SamplingDeadBlockPredictor(int numSets) : sampler(kSamplerSets * kSamplerAssoc),
-                                               predictor(kPredictorTables, std::vector<PredictorEntry>(kPredictorEntries)) {
-        assert(numSets % kSamplerSets == 0);
-    }
+
+    SamplingDeadBlockPredictor() : sampler(kSamplerSets * kSamplerAssoc),
+                                               predictor(kPredictorTables, std::vector<PredictorEntry>(kPredictorEntries)) {    }
+
+    int getKSamplerSets() {return kSamplerSets;}
 
     bool predict(uint64_t address, uint64_t pc) {
-        uint32_t set = (address >> 6) % kSamplerSets;
-        uint32_t tag = (address >> 12) & 0x7FFF;
+    // printf("sampler predict entered \n");
+      uint32_t set = (address >> 6) % kSamplerSets;
+      uint32_t tag = (address >> 11) & 0x7FFF; // block size 64 --> 6 bit; kSamplerSets = 32 --> 5 bits
+      
+      for (int i = 0; i < kSamplerAssoc ; ++i) {
+          SamplerEntry& entry = sampler[set * kSamplerAssoc + i];
+          if (entry.valid && entry.partialTag == tag) {
+              printf("sampler hit \n");
+              return entry.prediction;
+          }
+      }
+      
+      // skewed predictor
+      int confidence = 0;
+      for (int i = 0; i < kPredictorTables; ++i) {
+          uint16_t sig = signature(pc);
+          uint64_t index = hash(sig, i);
+          confidence += predictor[i][index].counter;
+      }
+      if (confidence >= 8) { printf("confidence >= 8 ? %d \n", confidence >= 8);}
+      return confidence >= 8;
 
-        for (int i = 0; i < kSamplerAssoc; ++i) {
-            SamplerEntry& entry = sampler[set * kSamplerAssoc + i];
-            if (entry.valid && entry.partialTag == tag) {
-                return entry.prediction;
-            }
-        }
-
-        int confidence = 0;
-        for (int i = 0; i < kPredictorTables; ++i) {
-            uint16_t sig = signature(pc);
-            uint64_t index = hash(sig, i);
-            confidence += predictor[i][index].counter;
-        }
-        return confidence >= 8;
     }
 
     void update(uint64_t pc, uint64_t address, bool dead) {
-        uint32_t partialPC = pc & 0x7FFF;
-        uint32_t set = (address >> 6) % kSamplerSets;
-        uint32_t tag = (address >> 12) & 0x7FFF;
+        uint32_t partialPC = pc & 0x7FFF; // 没用到过啊
+        uint32_t set = (address >> 6) % kSamplerSets ;  //blocksize = 2**6
+        uint32_t tag = (address >> 11) & 0x7FFF;
 
-        for (int i = 0; i < kSamplerAssoc; i++) {
+        // 在采样器中查找缓存块
+        for (int i = 0; i < kSamplerAssoc ; i++) {
             SamplerEntry& entry = sampler[set * kSamplerAssoc + i];
             if (entry.valid && entry.partialTag == tag) {
-                entry.partialPC = partialPC;
+                entry.partialPC = partialPC; // 不知道想干嘛
                 entry.prediction = dead;
-
+                
                 for (int j = 0; j < kSamplerAssoc; j++) {
                     if (sampler[set * kSamplerAssoc + j].lru < entry.lru) {
                         sampler[set * kSamplerAssoc + j].lru = std::min(sampler[set * kSamplerAssoc + j].lru + 1, 15);
@@ -78,6 +85,7 @@ public:
                 }
                 entry.lru = 0;
 
+                // update predictor
                 uint16_t sig = signature(pc);
                 for (int k = 0; k < kPredictorTables; ++k) {
                     uint64_t index = hash(sig, k);
@@ -87,16 +95,20 @@ public:
                         predictor[k][index].counter = std::max(predictor[k][index].counter - 1, 0);
                     }
                 }
+                printf("predictor updated \n");
                 return;
             }
         }
 
+        // 如果没找到的话，用LRU的方式更新sampler，不更新predictor
         int lru_index = 0;
         for (int i = 1; i < kSamplerAssoc; i++) {
             if (sampler[set * kSamplerAssoc + i].lru > sampler[set * kSamplerAssoc + lru_index].lru) {
                 lru_index = i;
             }
         }
+        
+        assert(set * kSamplerAssoc + lru_index < kSamplerSets * kSamplerAssoc);
 
         SamplerEntry& entry = sampler[set * kSamplerAssoc + lru_index];
         entry.valid = true;
@@ -110,62 +122,84 @@ public:
         }
         entry.lru = 0;
     }
-};
+}; 
 
-namespace {
-    std::map<CACHE*, SamplingDeadBlockPredictor> predictors;
+
+namespace
+{
+std::map<CACHE*, std::vector<uint64_t>> last_used_cycles;
+std::map<CACHE*, SamplingDeadBlockPredictor> predictors;
 }
 
-void CACHE::initialize_replacement() {
-    predictors[this] = SamplingDeadBlockPredictor(NUM_SET);
+void CACHE::initialize_replacement() { 
+    ::last_used_cycles[this] = std::vector<uint64_t>(NUM_SET * NUM_WAY); 
+    if (lower_level == nullptr) {
+      ::predictors[this] = SamplingDeadBlockPredictor();
+    }
 }
 
 uint32_t CACHE::find_victim(uint32_t triggering_cpu, uint64_t instr_id, uint32_t set, const BLOCK* current_set, uint64_t ip, uint64_t full_addr, uint32_t type) {
-    auto& predictor = predictors[this];
+    
+    if (NAME.find("LLC") != std::string::npos) {
+      
+        auto& predictor = ::predictors[this];
+        assert(NUM_SET != 0);
+        assert(NUM_SET / predictor.getKSamplerSets() != 0);
+        // 检查当前缓存集合是否对应于采样器中的一个集合
+        bool is_sampled_set = (set % (NUM_SET / predictor.getKSamplerSets())) == 0;
 
-    // Check if the current set is sampled
-    bool is_sampled_set = (set % (NUM_SET / predictor.kSamplerSets)) == 0;
-
-    if (is_sampled_set) {
-        // If it is a sampled set, try to find a predicted dead block
-        for (uint32_t way = 0; way < NUM_WAY; ++way) {
-            if (predictor.predict(current_set[way].address, ip)) {
-                return way;
+        if (is_sampled_set) {
+            // 如果是采样器集合,尝试找到一个预测为死块的缓存块
+            for (uint32_t way = 0; way < NUM_WAY; ++way) {
+                if (predictor.predict(ip, current_set[way].address)) {
+                    return way;
+                }
             }
         }
     }
 
-    // If no dead block is found or the set is not sampled, use LRU
-    auto begin = std::next(std::begin(block), set * NUM_WAY);
+    // 如果不是LLC，或者没有找到预测的死块或者不是采样器集合,则使用 LRU 策略选择受害者
+    auto begin = std::next(std::begin(::last_used_cycles[this]), set * NUM_WAY);
     auto end = std::next(begin, NUM_WAY);
-    auto victim = std::min_element(begin, end, [](const auto& a, const auto& b) { return a.lru < b.lru;});
-    assert(begin <= victim && victim < end);
-    return std::distance(begin, victim);
+    auto victim = std::min_element(begin, end);
+    assert(begin <= victim);
+    assert(victim < end);
+    return static_cast<uint32_t>(std::distance(begin, victim));
 }
 
 void CACHE::update_replacement_state(uint32_t triggering_cpu, uint32_t set, uint32_t way, uint64_t full_addr, uint64_t ip, uint64_t victim_addr, uint32_t type, uint8_t hit) {
-    auto& predictor = predictors[this];
+    //更新LRU状态
+    if (!hit || access_type{type} != access_type::WRITE) {
+        ::last_used_cycles[this].at(set * NUM_WAY + way) = current_cycle;
+    }
+    
+    
+    if (NAME.find("LLC") != std::string::npos) {
+    
+        // 检查当前缓存集合是否对应于采样器中的一个集合
+        auto& predictor = ::predictors[this];
+        assert(NUM_SET != 0);
+        assert(NUM_SET / predictor.getKSamplerSets() != 0);
+        bool is_sampled_set = (set % (NUM_SET / predictor.getKSamplerSets())) == 0;
 
-    block[set * NUM_WAY + way].lru = current_cycle;
-
-    // Check if the current set is sampled
-    bool is_sampled_set = (set % (NUM_SET / predictor.kSamplerSets)) == 0;
-
-    if (is_sampled_set) {
-        if (!hit || access_type{type} != access_type::WRITE) {
-            predictor.update(ip, full_addr, false);
-        } else {
-            predictor.update(ip, victim_addr, true);
+        if (is_sampled_set) {
+            if (!hit || access_type{type} != access_type::WRITE) {
+                predictor.update(ip, full_addr, false);
+            } else {
+                predictor.update(ip, victim_addr, true);
+            }
         }
     }
 }
 
-bool CACHE::should_bypass(uint64_t addr, uint64_t ip) {
+
+void CACHE::replacement_final_stats() {}
+
+
+bool should_bypass(uint64_t addr, uint64_t ip) {
     auto& predictor = predictors[this];
     return predictor.predict(addr, ip);
 }
-
-void CACHE::replacement_final_stats() {}
 
 
 bool CACHE::handle_fill(const mshr_type& fill_mshr)
